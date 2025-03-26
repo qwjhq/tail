@@ -219,7 +219,7 @@ func (tail *Tail) reopen(truncated bool) error {
 	// which causes the poller to hang on an open file handle to a file no longer being written to
 	// and which eventually gets deleted.  Save the current file handle info to make sure we only
 	// start tailing a different file.
-	cf, err := tail.file.Stat()
+	_, err := tail.file.Stat()
 	if !truncated && err != nil {
 		log.Print("stat of old file returned, this is not expected and may result in unexpected behavior")
 		// We don't action on this error but are logging it, not expecting to see it happen and not sure if we
@@ -235,6 +235,8 @@ func (tail *Tail) reopen(truncated bool) error {
 		tail.watcher.SetFile(tail.file)
 		tail.fileMtx.Unlock()
 		if err != nil {
+			// if error close file 
+			defer tail.closeFile() 
 			if os.IsNotExist(err) {
 				tail.Logger.Printf("Waiting for %s to appear...", tail.Filename)
 				if err := tail.watcher.BlockUntilExists(&tail.Tomb); err != nil {
@@ -248,28 +250,20 @@ func (tail *Tail) reopen(truncated bool) error {
 			return fmt.Errorf("Unable to open file %s: %s", tail.Filename, err)
 		}
 
-		// File exists and is opened, get information about it.
-		nf, err := tail.file.Stat()
-		if err != nil {
-			tail.Logger.Print("Failed to stat new file to be tailed, will try to open it again")
+		// <5.x内核的系统，对于logrotate move create、 copytruncate、 soft link log file
+		tail.Logger.Printf("reseek file %s set Location Whence 0 Offset 0", tail.Filename)
+		retries--
+		if retries <= 0 {
+			tail.closeFile()
+			return errors.New("gave up trying to reseeking log file with a different handle")
+		}
+		tail.Location.Whence = 0
+		tail.Location.Offset = 0
+
+		if _, err := tail.file.Seek(0, io.SeekStart); err != nil {
+			tail.Logger.Printf("Failed to seek to the beginning of truncated file %s: %s", tail.Filename, err)
 			tail.closeFile()
 			continue
-		}
-
-		// Check to see if we are trying to reopen and tail the exact same file (and it was not truncated).
-		if !truncated && cf != nil && os.SameFile(cf, nf) {
-			retries--
-			if retries <= 0 {
-				return errors.New("gave up trying to reopen log file with a different handle")
-			}
-
-			select {
-			case <-time.After(watch.DefaultPollingFileWatcherOptions.MaxPollFrequency):
-				tail.closeFile()
-				continue
-			case <-tail.Tomb.Dying():
-				return tomb.ErrDying
-			}
 		}
 		break
 	}
